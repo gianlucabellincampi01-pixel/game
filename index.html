@@ -1,0 +1,1128 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Arena Brawler (frecce su click)</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b0b0b; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; background:#0b0b0b; }
+    body { user-select:none; -webkit-user-select:none; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+/* =========================================================
+   ARENA BRAWLER (1 file)
+   - bg.jpg, hero.jpg, enemies.jpg nella stessa cartella
+   - COMANDI (gioco):
+       WASD = muovi
+       MUOVI IL MOUSE = mira
+       TIENI PREMUTO CLICK SINISTRO = spara frecce (visibili)
+       J = spada (animazione visibile)
+       Space = dash
+       H = mostra/nasconde comandi
+       B = debug contorno
+       E = editor perimetro (senza mouse)
+       R = restart (solo quando muori/vinci)
+   - NEMICI: pochi e scaglionati
+       0–30s: max 1 nemico
+       30–60s: max 2
+       60s+:  max 3
+   - AREA GIOCABILE: poligono (perimetro)
+     Editor (tastiera):
+       E = entra/esci editor
+       Frecce = muovi mirino   | Shift = più veloce
+       Space = aggiungi punto  | Backspace = rimuovi ultimo
+       Invio = salva perimetro | P = stampa JSON in console
+   ========================================================= */
+
+const CFG = {
+  IMG_BG: "bg.jpg",
+  IMG_HERO: "hero.jpg",
+  IMG_ENEMIES: "enemies.jpg",
+
+  gameDuration: 120,
+
+  chromaThreshold: 24,
+  spriteScalePlayer: 6.0,
+  spriteScaleEnemy: 5.2,
+
+  // Player
+  playerRadius: 14,
+  playerMaxHP: 320,
+  playerSpeed: 235,
+
+  dashDuration: 0.14,
+  dashSpeedMult: 3.0,
+  dashCooldown: 2.2,
+
+  invulnAfterHit: 0.25,
+
+  // SPADA (tasto J)
+  sword: { dur:0.42, a0:0.14, a1:0.28, cd:0.60, dmg:26, range:74, swingDeg:130, step:65 },
+
+  // FRECCE (tieni premuto click sinistro)
+  arrow: {
+    speed: 560,
+    fireRate: 6.0,     // frecce al secondo mentre tieni premuto
+    damage: 16,
+    life: 1.25,
+    radius: 3.5,
+  },
+
+  // Enemy base (muoiono un po' prima)
+  enemyBase: {
+    sword:  { r:14, hp:68, speed:105 },
+    zombie: { r:14, hp:82, speed:90  },
+  },
+
+  // Enemy attacks
+  eSwordSlash: { dur:0.44, a0:0.16, a1:0.28, cd:1.65, dmg:14, range:58, halfAngleDeg:70, step:75 },
+  eSwordLunge: { dur:0.62, a0:0.22, a1:0.38, cd:2.85, dmg:18, range:72, step:130 },
+
+  eZombieBite: { dur:0.38, a0:0.14, a1:0.20, cd:1.55, dmg:15, range:46, step:50 },
+  eZombieKick: { dur:0.50, a0:0.18, a1:0.30, cd:2.45, dmg:12, range:56, shove:160, step:85 },
+
+  // scaling leggero
+  enemyHpScaleEnd: 1.22,
+  enemyDmgScaleEnd: 1.25,
+  enemySpeedScaleEnd: 1.35,
+
+  spawnDelayStart: 2.8,
+  spawnDelayEnd: 1.4,
+
+  hudPad: 12,
+};
+
+/* ---------------- Utils ---------------- */
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+const rand=(a,b)=>a+Math.random()*(b-a);
+const dist2=(ax,ay,bx,by)=>{const dx=ax-bx,dy=ay-by;return dx*dx+dy*dy;};
+
+function angleDiff(a,b){
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI*2;
+  while (d < -Math.PI) d += Math.PI*2;
+  return d;
+}
+
+function distPointToSegmentSq(px,py, ax,ay, bx,by){
+  const dx = bx-ax, dy = by-ay;
+  const len2 = dx*dx + dy*dy || 1;
+  const t = clamp(((px-ax)*dx + (py-ay)*dy) / len2, 0, 1);
+  const cx = ax + dx*t, cy = ay + dy*t;
+  const ddx = px - cx, ddy = py - cy;
+  return ddx*ddx + ddy*ddy;
+}
+
+function drawWrappedText(ctx, text, x, y, maxWidth, lineHeight) {
+  const words = text.split(" ");
+  let line = "";
+  for (let n=0; n<words.length; n++) {
+    const testLine = line + words[n] + " ";
+    const w = ctx.measureText(testLine).width;
+    if (w > maxWidth && n > 0) { ctx.fillText(line, x, y); line = words[n] + " "; y += lineHeight; }
+    else line = testLine;
+  }
+  ctx.fillText(line, x, y);
+}
+
+/* ---------------- Canvas + world square ---------------- */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d", { alpha:false });
+
+let W=0,H=0,DPR=1;
+const world = { S:0, ox:0, oy:0 };
+
+function resize(){
+  DPR = window.devicePixelRatio || 1;
+  W = Math.floor(window.innerWidth);
+  H = Math.floor(window.innerHeight);
+  canvas.width = Math.floor(W*DPR);
+  canvas.height = Math.floor(H*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+
+  world.S = Math.floor(Math.min(W,H));
+  world.ox = Math.floor((W - world.S)/2);
+  world.oy = Math.floor((H - world.S)/2);
+
+  if (assets.bgImg) rebuildBgCache();
+  rebuildArenaWorld();
+}
+window.addEventListener("resize", resize);
+
+function screenToWorld(sx,sy){ return { x: sx - world.ox, y: sy - world.oy }; }
+function inWorld(wx,wy){ return wx>=0 && wy>=0 && wx<=world.S && wy<=world.S; }
+
+/* ---------------- Input (tastiera + mouse) ---------------- */
+const keys = new Set();
+const pressed = new Set();
+
+window.addEventListener("keydown",(e)=>{
+  if (["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code)) e.preventDefault();
+  if (!keys.has(e.code)) pressed.add(e.code);
+  keys.add(e.code);
+});
+window.addEventListener("keyup",(e)=>keys.delete(e.code));
+
+let mouseSX=0, mouseSY=0;
+let leftDown = false;
+
+canvas.addEventListener("mousemove",(e)=>{
+  const r = canvas.getBoundingClientRect();
+  mouseSX = e.clientX - r.left;
+  mouseSY = e.clientY - r.top;
+});
+canvas.addEventListener("mousedown",(e)=>{
+  if (e.button === 0) leftDown = true;
+});
+window.addEventListener("mouseup",(e)=>{
+  if (e.button === 0) leftDown = false;
+});
+canvas.addEventListener("contextmenu",(e)=> e.preventDefault());
+
+/* ---------------- Error overlay ---------------- */
+let fatalError = "";
+window.addEventListener("error", (e)=> { fatalError = e?.message ? e.message : "Errore sconosciuto"; });
+window.addEventListener("unhandledrejection", (e)=> { fatalError = String(e?.reason ?? "Promise rejection"); });
+
+/* ---------------- Assets ---------------- */
+const assets = {
+  ready:false,
+  error:"",
+  bgImg:null,
+  bgCache:null,
+  heroSprite:null,
+  enemySprites:[],
+};
+
+function loadImage(src){
+  return new Promise((resolve,reject)=>{
+    const img = new Image();
+    img.onload=()=>resolve(img);
+    img.onerror=()=>reject(new Error(`Non riesco a caricare: ${src}`));
+    img.src=src;
+  });
+}
+
+function chromaKeyToCanvas(img, threshold){
+  const off = document.createElement("canvas");
+  off.width = img.width; off.height = img.height;
+  const octx = off.getContext("2d");
+  octx.drawImage(img,0,0);
+
+  let imgData;
+  try { imgData = octx.getImageData(0,0,off.width,off.height); }
+  catch {
+    throw new Error("Il browser blocca la lettura dei pixel. Usa Live Server (http://127.0.0.1:5500) e non il doppio click.");
+  }
+
+  const d = imgData.data;
+  const r0=d[0], g0=d[1], b0=d[2];
+  const thr2 = threshold*threshold;
+
+  for(let i=0;i<d.length;i+=4){
+    const dr=d[i]-r0, dg=d[i+1]-g0, db=d[i+2]-b0;
+    if (dr*dr + dg*dg + db*db <= thr2) d[i+3]=0;
+  }
+  octx.putImageData(imgData,0,0);
+  return off;
+}
+
+function trimTransparent(can){
+  const w=can.width,h=can.height;
+  const c=can.getContext("2d");
+  const data=c.getImageData(0,0,w,h).data;
+  let minX=w,minY=h,maxX=-1,maxY=-1;
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      const a=data[(y*w+x)*4+3];
+      if(a>0){
+        if(x<minX)minX=x; if(y<minY)minY=y;
+        if(x>maxX)maxX=x; if(y>maxY)maxY=y;
+      }
+    }
+  }
+  if(maxX<0) return can;
+  const out=document.createElement("canvas");
+  out.width=maxX-minX+1; out.height=maxY-minY+1;
+  out.getContext("2d").drawImage(can,minX,minY,out.width,out.height,0,0,out.width,out.height);
+  return out;
+}
+
+function sliceEnemySheet(sheetCan){
+  const cols=5, rows=2;
+  const cellW=Math.floor(sheetCan.width/cols);
+  const cellH=Math.floor(sheetCan.height/rows);
+  const sprites=[];
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      const cell=document.createElement("canvas");
+      cell.width=cellW; cell.height=cellH;
+      const cc=cell.getContext("2d");
+      cc.drawImage(sheetCan,c*cellW,r*cellH,cellW,cellH,0,0,cellW,cellH);
+      sprites.push(trimTransparent(cell));
+    }
+  }
+  return sprites;
+}
+
+function rebuildBgCache(){
+  const img = assets.bgImg;
+  if(!img) return;
+
+  const Ssrc = Math.min(img.width, img.height);
+  const sx = Math.floor((img.width - Ssrc)/2);
+  const sy = Math.floor((img.height - Ssrc)/2);
+
+  const off = document.createElement("canvas");
+  off.width = world.S; off.height = world.S;
+  const octx = off.getContext("2d");
+  octx.imageSmoothingEnabled = true;
+  octx.drawImage(img, sx, sy, Ssrc, Ssrc, 0, 0, world.S, world.S);
+
+  octx.fillStyle = "rgba(0,0,0,0.35)";
+  octx.fillRect(0,0,world.S,world.S);
+
+  assets.bgCache = off;
+}
+
+async function loadAllAssets(){
+  try {
+    const [bg, hero, enemiesImg] = await Promise.all([
+      loadImage(CFG.IMG_BG),
+      loadImage(CFG.IMG_HERO),
+      loadImage(CFG.IMG_ENEMIES)
+    ]);
+
+    assets.bgImg = bg;
+    rebuildBgCache();
+
+    const heroKey = chromaKeyToCanvas(hero, CFG.chromaThreshold);
+    assets.heroSprite = trimTransparent(heroKey);
+
+    const enemiesKey = chromaKeyToCanvas(enemiesImg, CFG.chromaThreshold);
+    assets.enemySprites = sliceEnemySheet(enemiesKey);
+
+    assets.ready = true;
+  } catch(e){
+    assets.error = String(e.message || e);
+    assets.ready = false;
+  }
+}
+loadAllAssets();
+
+/* ---------------- Area giocabile (poligono) ---------------- */
+let ARENA_N = [
+  {x:0.10,y:0.10},
+  {x:0.90,y:0.10},
+  {x:0.90,y:0.90},
+  {x:0.10,y:0.90},
+];
+let ARENA = [];
+
+function rebuildArenaWorld(){
+  ARENA = ARENA_N.map(p => ({ x: p.x*world.S, y: p.y*world.S }));
+}
+
+function pointInPoly(px,py, poly){
+  let inside = false;
+  for(let i=0, j=poly.length-1; i<poly.length; j=i++){
+    const xi=poly[i].x, yi=poly[i].y;
+    const xj=poly[j].x, yj=poly[j].y;
+    const intersect = ((yi>py)!==(yj>py)) && (px < (xj-xi)*(py-yi)/(yj-yi + 1e-9) + xi);
+    if(intersect) inside = !inside;
+  }
+  return inside;
+}
+function minDistToPolyEdgesSq(px,py, poly){
+  let best = Infinity;
+  for(let i=0;i<poly.length;i++){
+    const a = poly[i];
+    const b = poly[(i+1)%poly.length];
+    const d2 = distPointToSegmentSq(px,py, a.x,a.y, b.x,b.y);
+    if (d2 < best) best = d2;
+  }
+  return best;
+}
+function walkable(px,py, r){
+  if (ARENA.length < 3) return true;
+  if (!pointInPoly(px,py, ARENA)) return false;
+  const d2 = minDistToPolyEdgesSq(px,py, ARENA);
+  return d2 >= (r*r);
+}
+function moveWithinArena(entity, vx, vy, dt){
+  const nx = entity.x + vx*dt;
+  if (walkable(nx, entity.y, entity.r)) entity.x = nx;
+  const ny = entity.y + vy*dt;
+  if (walkable(entity.x, ny, entity.r)) entity.y = ny;
+}
+
+/* ---------------- Editor perimetro (tastiera) ---------------- */
+const edit = { on:false, current: [], cursorX:0.5, cursorY:0.5 };
+
+function toggleEdit(){
+  edit.on = !edit.on;
+  if (edit.on){
+    game.mode = "edit";
+    edit.current = [];
+    edit.cursorX = 0.5; edit.cursorY = 0.5;
+  } else {
+    edit.current = [];
+    if (game.mode === "edit") game.mode = "playing";
+    last = performance.now();
+  }
+}
+function addEditPointAtCursor(){
+  edit.current.push({ x: clamp(edit.cursorX,0,1), y: clamp(edit.cursorY,0,1) });
+}
+function finalizeArena(){
+  if (edit.current.length >= 3){
+    ARENA_N = edit.current.slice();
+    rebuildArenaWorld();
+    edit.current = [];
+  }
+}
+function printArena(){
+  console.log("Copia e incolla ARENA_N con questo:\n", JSON.stringify(ARENA_N, null, 2));
+}
+
+/* ---------------- Combat helpers ---------------- */
+function inFrontArc(attacker, target, range, facingAngle, halfAngleRad){
+  const dx = target.x - attacker.x;
+  const dy = target.y - attacker.y;
+  const d = Math.hypot(dx,dy);
+  if (d > range + target.r) return false;
+  const ang = Math.atan2(dy, dx);
+  const diff = Math.abs(angleDiff(ang, facingAngle));
+  return diff <= halfAngleRad;
+}
+
+/* ---------------- Game state ---------------- */
+let nextId = 1;
+let game, player, enemies, arrows;
+
+function makeGame(){
+  return {
+    mode:"title", // title | playing | edit | over | win
+    elapsed: 0,
+    timeLeft: CFG.gameDuration,
+    kills: 0,
+    help: true,
+    debug: false,
+    spawnT: 0,
+  };
+}
+
+function difficultyT(){ return clamp(game.elapsed / CFG.gameDuration, 0, 1); }
+function enemyScales(){
+  const t = difficultyT();
+  return {
+    hp: lerp(1.0, CFG.enemyHpScaleEnd, t),
+    dmg: lerp(1.0, CFG.enemyDmgScaleEnd, t),
+    spd: lerp(1.0, CFG.enemySpeedScaleEnd, t),
+  };
+}
+function allowedEnemyCap(){
+  if (game.elapsed < 30) return 1;
+  if (game.elapsed < 60) return 2;
+  return 3;
+}
+function spawnDelay(){ return lerp(CFG.spawnDelayStart, CFG.spawnDelayEnd, difficultyT()); }
+
+const ZOMBIE_SPRITES = new Set([1,7]);
+
+function randomEdgeSpawnInside(){
+  if (ARENA.length < 3) return {x: world.S*0.5, y: world.S*0.2};
+  const i = (Math.random()*ARENA.length)|0;
+  const a = ARENA[i];
+  const b = ARENA[(i+1)%ARENA.length];
+  const t = Math.random();
+  const ex = lerp(a.x,b.x,t);
+  const ey = lerp(a.y,b.y,t);
+  const cx = world.S*0.5, cy = world.S*0.5;
+  const dx = cx - ex, dy = cy - ey;
+  const len = Math.hypot(dx,dy) || 1;
+  return { x: ex + (dx/len)*45, y: ey + (dy/len)*45 };
+}
+
+function spawnEnemy(){
+  const sc = enemyScales();
+  const spriteIndex = (Math.random()*10)|0;
+  const archetype = ZOMBIE_SPRITES.has(spriteIndex) ? "zombie" : "sword";
+  const base = CFG.enemyBase[archetype];
+  const p = randomEdgeSpawnInside();
+  const personalSpeedMult = rand(0.85, 1.20);
+
+  let x=p.x, y=p.y;
+  for(let k=0;k<30;k++){
+    if (walkable(x,y, base.r)) break;
+    x = lerp(x, world.S*0.5, 0.14);
+    y = lerp(y, world.S*0.5, 0.14);
+  }
+
+  enemies.push({
+    id: nextId++,
+    archetype, spriteIndex,
+    x, y, r: base.r,
+    hp: base.hp * sc.hp,
+    maxHp: base.hp * sc.hp,
+    speed: base.speed * sc.spd * personalSpeedMult,
+    dmgScale: sc.dmg,
+    slotAngle: rand(0, Math.PI*2),
+    stun: 0,
+    cd1: rand(0.4, 1.0),
+    cd2: rand(0.8, 1.5),
+    attack: null,
+    kbVX: 0, kbVY: 0,
+  });
+}
+
+function resetGame(toTitle=false){
+  game = makeGame();
+  if (!toTitle) game.mode = "playing";
+
+  enemies = [];
+  arrows = [];
+
+  player = {
+    x: world.S*0.5,
+    y: world.S*0.6,
+    r: CFG.playerRadius,
+    hp: CFG.playerMaxHP,
+    maxHp: CFG.playerMaxHP,
+
+    facing: 0,
+    dashT: 0,
+    dashCd: 0,
+    inv: 0,
+
+    swordCd: 0,
+    swordAtk: null, // {t, hitSet}
+
+    arrowCd: 0,
+    bowAnim: 0,
+
+    kbVX: 0, kbVY: 0,
+  };
+
+  for(let k=0;k<40;k++){
+    if (walkable(player.x,player.y, player.r)) break;
+    player.x = lerp(player.x, world.S*0.5, 0.2);
+    player.y = lerp(player.y, world.S*0.5, 0.2);
+  }
+
+  game.spawnT = 0.6;
+}
+
+/* ---------------- Rendering helpers ---------------- */
+function drawSpriteCentered(spriteCanvas, x, y, targetH, flipX=false, yOffset=0){
+  if(!spriteCanvas) return;
+  const aspect = spriteCanvas.width / spriteCanvas.height;
+  const h = targetH;
+  const w = h * aspect;
+  ctx.imageSmoothingEnabled = false;
+  ctx.save();
+  ctx.translate(x, y + yOffset);
+  if (flipX) ctx.scale(-1,1);
+  ctx.drawImage(spriteCanvas, -w/2, -h/2, w, h);
+  ctx.restore();
+}
+
+/* ---------------- Enemy attacks ---------------- */
+function startEnemyAttack(e, kind){
+  if (e.attack) return;
+  e.attack = { kind, t:0, hitDone:false };
+}
+function enemyProfile(e, kind){
+  if (e.archetype==="sword"){
+    if (kind==="a1") return { name:"slash", ...CFG.eSwordSlash };
+    return { name:"lunge", ...CFG.eSwordLunge };
+  } else {
+    if (kind==="a1") return { name:"bite", ...CFG.eZombieBite };
+    return { name:"kick", ...CFG.eZombieKick };
+  }
+}
+function doEnemyAttackDamage(e){
+  if(!e.attack) return;
+  const prof = enemyProfile(e, e.attack.kind);
+  const active = e.attack.t>=prof.a0 && e.attack.t<=prof.a1;
+  if(!active || e.attack.hitDone) return;
+
+  const ang = Math.atan2(player.y - e.y, player.x - e.x);
+
+  let hit=false;
+  if (e.archetype==="sword" && prof.name==="slash"){
+    const half = (prof.halfAngleDeg*Math.PI/180);
+    hit = inFrontArc(e, player, prof.range, ang, half);
+  } else {
+    const hx = e.x + Math.cos(ang)*(prof.range*0.55);
+    const hy = e.y + Math.sin(ang)*(prof.range*0.55);
+    const rr = (prof.range*0.45) + player.r;
+    hit = dist2(hx,hy, player.x,player.y) <= rr*rr;
+  }
+
+  if(hit && player.inv<=0){
+    player.hp -= prof.dmg * (e.dmgScale||1);
+    player.inv = CFG.invulnAfterHit;
+    e.attack.hitDone = true;
+
+    player.kbVX += Math.cos(ang) * (prof.shove ? prof.shove : 130);
+    player.kbVY += Math.sin(ang) * (prof.shove ? prof.shove : 130);
+  }
+}
+
+/* ---------------- Player: SPADA (J) ---------------- */
+function startSword(){
+  if (player.swordAtk) return;
+  if (player.swordCd > 0) return;
+  player.swordAtk = { t:0, hitSet: new Set() };
+  player.swordCd = CFG.sword.cd;
+}
+
+function doSwordDamage(){
+  const a = player.swordAtk;
+  if(!a) return;
+  const P = CFG.sword;
+
+  if(!(a.t>=P.a0 && a.t<=P.a1)) return;
+
+  const half = (P.swingDeg*Math.PI/180)*0.5;
+  for(const e of enemies){
+    if (a.hitSet.has(e.id)) continue;
+    if (inFrontArc(player, e, P.range, player.facing, half)){
+      e.hp -= P.dmg;
+      a.hitSet.add(e.id);
+      e.kbVX += Math.cos(player.facing)*150;
+      e.kbVY += Math.sin(player.facing)*150;
+      e.stun = Math.max(e.stun, 0.14);
+    }
+  }
+}
+
+/* ---------------- Player: FRECCE (mouse left hold) ---------------- */
+function spawnArrow(){
+  const A = CFG.arrow;
+  const ang = player.facing;
+
+  const ox = player.x + Math.cos(ang)*(player.r + 10);
+  const oy = player.y + Math.sin(ang)*(player.r + 10);
+
+  arrows.push({
+    x: ox, y: oy,
+    vx: Math.cos(ang)*A.speed,
+    vy: Math.sin(ang)*A.speed,
+    life: A.life,
+    r: A.radius,
+    dmg: A.damage,
+    ang,
+  });
+
+  player.bowAnim = 0.12;
+}
+
+function updateArrows(dt){
+  for (let i=arrows.length-1; i>=0; i--){
+    const a = arrows[i];
+    a.life -= dt;
+    if (a.life <= 0){ arrows.splice(i,1); continue; }
+
+    a.x += a.vx * dt;
+    a.y += a.vy * dt;
+
+    if (!walkable(a.x, a.y, a.r)){
+      arrows.splice(i,1);
+      continue;
+    }
+
+    for (const e of enemies){
+      const rr = a.r + e.r;
+      if (dist2(a.x,a.y,e.x,e.y) <= rr*rr){
+        e.hp -= a.dmg;
+        e.kbVX += (a.vx>0?1:-1) * 70;
+        e.kbVY += (a.vy>0?1:-1) * 70;
+        e.stun = Math.max(e.stun, 0.08);
+        arrows.splice(i,1);
+        break;
+      }
+    }
+  }
+}
+
+/* ---------------- Separation ---------------- */
+function separateEnemies(){
+  for(let i=0;i<enemies.length;i++){
+    for(let j=i+1;j<enemies.length;j++){
+      const a=enemies[i], b=enemies[j];
+      const dx=b.x-a.x, dy=b.y-a.y;
+      const d = Math.hypot(dx,dy) || 1;
+      const min = a.r + b.r + 3;
+      if (d < min){
+        const push = (min - d) * 0.5;
+        const nx = dx/d, ny = dy/d;
+        a.x -= nx*push; a.y -= ny*push;
+        b.x += nx*push; b.y += ny*push;
+      }
+    }
+  }
+}
+
+/* ---------------- Update ---------------- */
+function update(dt){
+  dt = clamp(dt, 0, 1/20);
+
+  if (pressed.has("KeyH")) game.help = !game.help;
+  if (pressed.has("KeyB")) game.debug = !game.debug;
+  if (pressed.has("KeyE")) toggleEdit();
+
+  if (game.mode === "title"){
+    if (pressed.has("Enter")) { game.mode="playing"; last = performance.now(); }
+    return;
+  }
+
+  // editor (tastiera)
+  if (edit.on){
+    const fast = keys.has("ShiftLeft") || keys.has("ShiftRight");
+    const step = fast ? 0.012 : 0.006;
+
+    if (keys.has("ArrowUp")) edit.cursorY -= step;
+    if (keys.has("ArrowDown")) edit.cursorY += step;
+    if (keys.has("ArrowLeft")) edit.cursorX -= step;
+    if (keys.has("ArrowRight")) edit.cursorX += step;
+
+    edit.cursorX = clamp(edit.cursorX, 0, 1);
+    edit.cursorY = clamp(edit.cursorY, 0, 1);
+
+    if (pressed.has("Space")) addEditPointAtCursor();
+    if (pressed.has("Backspace") && edit.current.length>0) edit.current.pop();
+    if (pressed.has("Enter")) finalizeArena();
+    if (pressed.has("KeyP")) printArena();
+    return;
+  }
+
+  if (game.mode !== "playing") return;
+
+  // timer
+  game.elapsed += dt;
+  game.timeLeft = Math.max(0, CFG.gameDuration - game.elapsed);
+
+  if (player.hp <= 0){ player.hp = 0; game.mode="over"; return; }
+  if (game.timeLeft <= 0){ game.mode="win"; return; }
+
+  // cooldowns
+  player.dashCd = Math.max(0, player.dashCd - dt);
+  player.inv = Math.max(0, player.inv - dt);
+  player.swordCd = Math.max(0, player.swordCd - dt);
+  player.arrowCd = Math.max(0, player.arrowCd - dt);
+  player.bowAnim = Math.max(0, player.bowAnim - dt);
+
+  // mira col mouse
+  const mw = screenToWorld(mouseSX, mouseSY);
+  if (inWorld(mw.x,mw.y)){
+    player.facing = Math.atan2(mw.y - player.y, mw.x - player.x);
+  }
+
+  // dash
+  if (pressed.has("Space") && player.dashCd<=0){
+    player.dashT = CFG.dashDuration;
+    player.dashCd = CFG.dashCooldown;
+  }
+  player.dashT = Math.max(0, player.dashT - dt);
+
+  // movimento player
+  let ix=0, iy=0;
+  if(keys.has("KeyW")) iy -= 1;
+  if(keys.has("KeyS")) iy += 1;
+  if(keys.has("KeyA")) ix -= 1;
+  if(keys.has("KeyD")) ix += 1;
+  const il = Math.hypot(ix,iy) || 1;
+  ix/=il; iy/=il;
+
+  // knockback decay
+  player.kbVX *= Math.pow(0.001, dt);
+  player.kbVY *= Math.pow(0.001, dt);
+
+  let spd = CFG.playerSpeed;
+  if (player.dashT > 0) spd *= CFG.dashSpeedMult;
+
+  // step durante swing spada
+  let swordStepVX=0, swordStepVY=0;
+  if (player.swordAtk){
+    const P=CFG.sword;
+    const step = (player.swordAtk.t>=P.a0 && player.swordAtk.t<=P.a1) ? P.step : 0;
+    swordStepVX += Math.cos(player.facing)*step;
+    swordStepVY += Math.sin(player.facing)*step;
+  }
+
+  const vx = ix*spd + player.kbVX + swordStepVX;
+  const vy = iy*spd + player.kbVY + swordStepVY;
+  moveWithinArena(player, vx, vy, dt);
+
+  // spada = tasto J
+  if (pressed.has("KeyJ")) startSword();
+
+  // update spada
+  if (player.swordAtk){
+    player.swordAtk.t += dt;
+    doSwordDamage();
+    if (player.swordAtk.t >= CFG.sword.dur) player.swordAtk = null;
+  }
+
+  // FRECCE: SOLO se tieni premuto tasto sinistro
+  if (leftDown){
+    const rate = CFG.arrow.fireRate;
+    const shotInterval = 1 / rate;
+    if (player.arrowCd <= 0){
+      spawnArrow();
+      player.arrowCd = shotInterval;
+    }
+  }
+
+  // proiettili
+  updateArrows(dt);
+
+  // spawn scaglionato
+  const cap = allowedEnemyCap();
+  game.spawnT -= dt;
+  if (enemies.length < cap && game.spawnT <= 0){
+    spawnEnemy();
+    game.spawnT = spawnDelay();
+  }
+
+  // enemies update
+  for (const e of enemies){
+    e.stun = Math.max(0, e.stun - dt);
+    e.cd1 = Math.max(0, e.cd1 - dt);
+    e.cd2 = Math.max(0, e.cd2 - dt);
+
+    e.kbVX *= Math.pow(0.001, dt);
+    e.kbVY *= Math.pow(0.001, dt);
+
+    if (e.attack){
+      e.attack.t += dt;
+      doEnemyAttackDamage(e);
+
+      const prof = enemyProfile(e, e.attack.kind);
+      const ang = Math.atan2(player.y - e.y, player.x - e.x);
+
+      if (prof.step && e.attack.t <= prof.a1){
+        e.kbVX += Math.cos(ang) * prof.step;
+        e.kbVY += Math.sin(ang) * prof.step;
+      }
+      if (e.attack.t >= prof.dur) e.attack = null;
+    }
+
+    if (e.stun <= 0){
+      e.slotAngle += dt*0.28;
+      const desiredR = 105;
+      let tx = player.x + Math.cos(e.slotAngle)*desiredR;
+      let ty = player.y + Math.sin(e.slotAngle)*desiredR;
+
+      if (dist2(e.x,e.y, player.x,player.y) > 200*200){
+        tx = player.x; ty = player.y;
+      }
+
+      let dx = tx - e.x, dy = ty - e.y;
+      const len = Math.hypot(dx,dy) || 1;
+
+      const vxE = (dx/len)*e.speed + e.kbVX;
+      const vyE = (dy/len)*e.speed + e.kbVY;
+
+      moveWithinArena(e, vxE, vyE, dt);
+    } else {
+      moveWithinArena(e, e.kbVX, e.kbVY, dt);
+    }
+
+    if (!e.attack && e.stun<=0){
+      const d = Math.hypot(player.x - e.x, player.y - e.y);
+      if (e.archetype==="sword"){
+        if (d < 70 && e.cd1<=0) { startEnemyAttack(e,"a1"); e.cd1 = CFG.eSwordSlash.cd; }
+        else if (d < 115 && e.cd2<=0) { startEnemyAttack(e,"a2"); e.cd2 = CFG.eSwordLunge.cd; }
+      } else {
+        if (d < 58 && e.cd1<=0) { startEnemyAttack(e,"a1"); e.cd1 = CFG.eZombieBite.cd; }
+        else if (d < 92 && e.cd2<=0) { startEnemyAttack(e,"a2"); e.cd2 = CFG.eZombieKick.cd; }
+      }
+    }
+  }
+
+  // remove dead
+  for (let i=enemies.length-1; i>=0; i--){
+    if (enemies[i].hp <= 0){
+      enemies.splice(i,1);
+      game.kills++;
+    }
+  }
+  separateEnemies();
+
+  if (!walkable(player.x, player.y, player.r)){
+    player.x = lerp(player.x, world.S*0.5, 0.2);
+    player.y = lerp(player.y, world.S*0.5, 0.2);
+  }
+}
+
+/* ---------------- Render ---------------- */
+function render(){
+  if (!assets.ready || assets.error || fatalError){
+    ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle="rgba(255,255,255,0.92)";
+    ctx.font="20px system-ui, Arial";
+    ctx.fillText("Caricamento...", 20, 40);
+
+    const err = assets.error || fatalError;
+    ctx.font="14px system-ui, Arial";
+    ctx.fillStyle="rgba(255,255,255,0.72)";
+    ctx.fillText("File richiesti: bg.jpg, hero.jpg, enemies.jpg (stessa cartella).", 20, 70);
+    ctx.fillText("Apri con Live Server: http://127.0.0.1:5500/index.html", 20, 92);
+
+    if (err){
+      ctx.fillStyle="rgba(255,140,140,0.95)";
+      ctx.font="16px system-ui, Arial";
+      ctx.fillText("ERRORE:", 20, 130);
+      ctx.fillStyle="rgba(255,255,255,0.85)";
+      ctx.font="14px system-ui, Arial";
+      drawWrappedText(ctx, err, 20, 154, Math.min(900, W-40), 18);
+    }
+    return;
+  }
+
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+
+  ctx.save();
+  ctx.translate(world.ox, world.oy);
+
+  if(assets.bgCache){
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(assets.bgCache, 0, 0);
+  } else {
+    ctx.fillStyle="#161616";
+    ctx.fillRect(0,0,world.S,world.S);
+  }
+
+  if (game.debug || edit.on){
+    const poly = edit.on
+      ? edit.current.map(p=>({x:p.x*world.S,y:p.y*world.S}))
+      : ARENA;
+    if (poly.length >= 2){
+      ctx.strokeStyle="rgba(255,255,255,0.75)";
+      ctx.lineWidth=3;
+      ctx.beginPath();
+      ctx.moveTo(poly[0].x, poly[0].y);
+      for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x, poly[i].y);
+      if (!edit.on && poly.length>=3) ctx.closePath();
+      ctx.stroke();
+    }
+  }
+
+  if (edit.on){
+    const cx = edit.cursorX*world.S;
+    const cy = edit.cursorY*world.S;
+    ctx.strokeStyle="rgba(255,255,255,0.9)";
+    ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(cx-10,cy); ctx.lineTo(cx+10,cy);
+    ctx.moveTo(cx,cy-10); ctx.lineTo(cx,cy+10);
+    ctx.stroke();
+
+    ctx.fillStyle="rgba(255,255,255,0.9)";
+    for(const p of edit.current){
+      ctx.beginPath();
+      ctx.arc(p.x*world.S, p.y*world.S, 4, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // arrows
+  for(const a of arrows){
+    const tail = 10;
+    const tx = a.x - Math.cos(a.ang)*tail;
+    const ty = a.y - Math.sin(a.ang)*tail;
+
+    ctx.strokeStyle="rgba(255,255,255,0.95)";
+    ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(tx,ty);
+    ctx.lineTo(a.x,a.y);
+    ctx.stroke();
+
+    ctx.fillStyle="rgba(255,255,255,0.95)";
+    ctx.save();
+    ctx.translate(a.x,a.y);
+    ctx.rotate(a.ang);
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.lineTo(-6, -3);
+    ctx.lineTo(-6,  3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // enemies
+  for(const e of enemies){
+    const spr = assets.enemySprites[e.spriteIndex];
+    const flip = (player.x < e.x);
+    drawSpriteCentered(spr, e.x, e.y, e.r*CFG.spriteScaleEnemy, flip, Math.sin((game.elapsed+e.id)*6)*1.0);
+
+    const t = clamp(e.hp/e.maxHp, 0, 1);
+    ctx.fillStyle="rgba(0,0,0,0.45)";
+    ctx.fillRect(e.x-18, e.y-e.r-18, 36, 4);
+    ctx.fillStyle="rgba(255,255,255,0.75)";
+    ctx.fillRect(e.x-18, e.y-e.r-18, 36*t, 4);
+  }
+
+  // player
+  const flipP = (Math.cos(player.facing) < 0);
+  drawSpriteCentered(assets.heroSprite, player.x, player.y, player.r*CFG.spriteScalePlayer, flipP, Math.sin(game.elapsed*8)*1.2);
+
+  // bow anim
+  if (player.bowAnim > 0){
+    const ang = player.facing;
+    const bx = player.x + Math.cos(ang)*(player.r + 10);
+    const by = player.y + Math.sin(ang)*(player.r + 10);
+    ctx.strokeStyle="rgba(255,255,255,0.60)";
+    ctx.lineWidth=3;
+    ctx.beginPath();
+    const r = 10 + (player.bowAnim*20);
+    ctx.arc(bx, by, r, ang - 1.0, ang + 1.0);
+    ctx.stroke();
+    ctx.strokeStyle="rgba(255,255,255,0.45)";
+    ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(bx + Math.cos(ang-1.0)*r, by + Math.sin(ang-1.0)*r);
+    ctx.lineTo(bx + Math.cos(ang+1.0)*r, by + Math.sin(ang+1.0)*r);
+    ctx.stroke();
+  }
+
+  // sword anim
+  if (player.swordAtk){
+    const t = clamp(player.swordAtk.t / CFG.sword.dur, 0, 1);
+    const swing = (CFG.sword.swingDeg * Math.PI/180);
+    const start = player.facing - swing*0.5;
+    const end   = player.facing + swing*0.5;
+    const a = start + (end-start)*t;
+
+    const len = CFG.sword.range;
+    const w = 6;
+
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(a);
+
+    ctx.fillStyle="rgba(255,255,255,0.55)";
+    ctx.fillRect(8, -2, 10, 4);
+
+    ctx.fillStyle="rgba(255,255,255,0.85)";
+    ctx.fillRect(18, -w/2, len-18, w);
+
+    ctx.restore();
+
+    ctx.strokeStyle="rgba(255,255,255,0.25)";
+    ctx.lineWidth=4;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, CFG.sword.range*0.85, start, end);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // HUD
+  const p = CFG.hudPad;
+  ctx.fillStyle="rgba(0,0,0,0.40)";
+  ctx.fillRect(p-6, p-6, 820, game.help ? 215 : 140);
+
+  const hpT = clamp(player.hp/player.maxHp,0,1);
+  ctx.fillStyle="rgba(255,255,255,0.12)";
+  ctx.fillRect(p,p,260,14);
+  ctx.fillStyle="rgba(255,255,255,0.80)";
+  ctx.fillRect(p,p,260*hpT,14);
+
+  ctx.fillStyle="rgba(255,255,255,0.92)";
+  ctx.font="14px system-ui, Arial";
+
+  if (game.mode === "title"){
+    ctx.fillStyle="rgba(0,0,0,0.72)";
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle="rgba(255,255,255,0.95)";
+    ctx.font="34px system-ui, Arial";
+    ctx.fillText("ARENA BRAWLER", 60, 110);
+
+    ctx.font="16px system-ui, Arial";
+    ctx.fillStyle="rgba(255,255,255,0.85)";
+    ctx.fillText("Premi INVIO per iniziare", 60, 150);
+
+    ctx.fillStyle="rgba(255,255,255,0.75)";
+    ctx.fillText("Comandi:", 60, 190);
+    ctx.fillText("WASD muovi | MUOVI MOUSE = mira | TIENI CLICK SINISTRO = frecce | J = spada | Space dash", 60, 214);
+    ctx.fillText("E editor perimetro (tastiera) | H mostra/nasconde comandi | B debug contorno", 60, 238);
+    ctx.fillText("Obiettivo: sopravvivi 120 secondi", 60, 270);
+    return;
+  }
+
+  ctx.fillText(`Vita: ${Math.round(player.hp)} / ${player.maxHp}`, p, p+36);
+  ctx.fillText(`Tempo: ${Math.ceil(game.timeLeft)}s`, p, p+56);
+
+  const cap = allowedEnemyCap();
+  ctx.fillText(`Nemici: ${enemies.length}/${cap}  |  Kills: ${game.kills}`, p, p+76);
+
+  ctx.fillStyle="rgba(255,255,255,0.80)";
+  ctx.fillText(`Spada(J) CD: ${player.swordCd.toFixed(1)}s  | Dash(Space) CD: ${player.dashCd.toFixed(1)}s`, p, p+98);
+
+  if (edit.on){
+    ctx.fillStyle="rgba(255,255,255,0.85)";
+    ctx.fillText(`EDITOR: Frecce muovi mirino • Shift veloce • Space punto • Backspace annulla • Invio salva • P stampa JSON • E esci`, p, p+120);
+  } else if (game.help){
+    ctx.fillStyle="rgba(255,255,255,0.78)";
+    ctx.fillText(`Mira col mouse • Tieni premuto click sinistro = frecce • J = spada`, p, p+120);
+    ctx.fillText(`H = comandi • E = editor • B = debug • Space = dash`, p, p+140);
+  } else {
+    ctx.fillStyle="rgba(255,255,255,0.65)";
+    ctx.fillText(`H = comandi • E = editor • B = debug`, p, p+120);
+  }
+
+  if (game.mode==="over" || game.mode==="win"){
+    ctx.fillStyle="rgba(0,0,0,0.70)";
+    ctx.fillRect(0,0,W,H);
+
+    const title = game.mode==="win" ? "HAI VINTO!" : "GAME OVER";
+    const sub = "Premi R per ricominciare";
+
+    ctx.fillStyle="rgba(255,255,255,0.92)";
+    ctx.font="48px system-ui, Arial";
+    const tw = ctx.measureText(title).width;
+    ctx.fillText(title, (W-tw)/2, H*0.45);
+
+    ctx.fillStyle="rgba(255,255,255,0.75)";
+    ctx.font="16px system-ui, Arial";
+    const sw = ctx.measureText(sub).width;
+    ctx.fillText(sub, (W-sw)/2, H*0.45+36);
+  }
+}
+
+/* ---------------- Main loop ---------------- */
+let last = performance.now();
+
+function frame(now){
+  const dt = (now-last)/1000;
+  last = now;
+
+  if (pressed.has("KeyR") && (game?.mode==="over" || game?.mode==="win")) resetGame(false);
+
+  update(dt);
+  render();
+
+  pressed.clear();
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- Init ---------------- */
+resize();
+rebuildArenaWorld();
+resetGame(true);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
